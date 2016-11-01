@@ -18,6 +18,7 @@ var (
 	statsdAddr   = kingpin.Flag("statsd-addr", "Statsd address").Short('s').String()
 	statsdPrefix = kingpin.Flag("statsd-prefix", "Statsd prefix").Short('p').String()
 	interval     = kingpin.Flag("refresh-interval", "Interval to refresh offset lag in seconds").Short('i').Default("5").Int()
+	tags         = kingpin.Flag("tags", "Use tags if your StatsD client supports them (like DataDog and InfluxDB)").Default("false").Bool()
 )
 
 func main() {
@@ -88,7 +89,11 @@ func main() {
 						lag := tOffset - cgOffset
 
 						log.Info("Topic: %s, Partition: %d, Consumer Group: %s, Lag: %d", topic, partitionID, cg.Name, lag)
-						stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg.Name), lag)
+						if *tags {
+							stats.Gauge(fmt.Sprintf("consumer_lag,topic=%s,partition=%d,consumer_group=%s", topic, partitionID, cg.Name), lag)
+						} else {
+							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg.Name), lag)
+						}
 					}
 				}
 			}

@@ -7,7 +7,7 @@ Send your Kafka offset lags to StatsD.
 ## Usage
 
 ```
-kafka-statsd --zookeeper-addrs host1:2181,host2:2181 --statsd-addr=statsd:8125 --statsd-prefix kafka.
+kafka-statsd --zookeeper-addrs host1:2181,host2:2181 --statsd-addr=statsd:8125 --statsd-prefix kafka. --tags
 ```
 
 ### Args
@@ -18,6 +18,17 @@ kafka-statsd --zookeeper-addrs host1:2181,host2:2181 --statsd-addr=statsd:8125 -
 | **--statsd-addr**      | StatsD address.                                                                                                                                                         |
 | **--statsd-prefix**    | StatsD prefix.                                                                                                                                                          |
 | **--refresh-interval** | Interval to refresh offset lag, in seconds. Default is 5s.                                                                                                              |
+| **--tags**             | Use tags if your StatsD client supports them (like DataDog and InfluxDB). Default is false.                                                                             |
+
+### StatsD metric:
+
+With tags:
+
+    kafka_consumer_lag,topic=TOPIC,partition=PARTITION,consumer_group=CONSUMER_GROUP = N
+
+Without tags:
+
+    topic.TOPIC.partition.PARTITION.consumer_group.CONSUMER_GROUP.lag = N
 
 ## Install
 
