@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/Shopify/sarama"
@@ -18,7 +19,8 @@ var (
 	statsdAddr   = kingpin.Flag("statsd-addr", "Statsd address").Short('s').String()
 	statsdPrefix = kingpin.Flag("statsd-prefix", "Statsd prefix").Short('p').String()
 	interval     = kingpin.Flag("refresh-interval", "Interval to refresh offset lag in seconds").Short('i').Default("5").Int()
-	tags         = kingpin.Flag("tags", "Use tags if your StatsD client supports them (like DataDog and InfluxDB)").Default("false").Bool()
+	useTags      = kingpin.Flag("use-tags", "Use tags if your StatsD client supports them (like DataDog and InfluxDB)").Default("false").Bool()
+	includeTags  = kingpin.Flag("include-tags", "Tags to include, if you want to include a host name or datacenter for example.").Strings()
 )
 
 func main() {
@@ -89,8 +91,17 @@ func main() {
 						lag := tOffset - cgOffset
 
 						log.Info("Topic: %s, Partition: %d, Consumer Group: %s, Lag: %d", topic, partitionID, cg.Name, lag)
-						if *tags {
-							stats.Gauge(fmt.Sprintf("consumer_lag,topic=%s,partition=%d,consumer_group=%s", topic, partitionID, cg.Name), lag)
+						if useTags != nil {
+							var tags []string
+							tags = append(tags, "topic="+topic)
+							tags = append(tags, fmt.Sprintf("partition=%d", partitionID))
+							tags = append(tags, "consumer_group="+cg.Name)
+							if includeTags != nil {
+								for _, t := range *includeTags {
+									tags = append(tags, t)
+								}
+							}
+							stats.Gauge(fmt.Sprintf("consumer_lag,%s", strings.Join(tags, ",")), lag)
 						} else {
 							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg.Name), lag)
 						}
