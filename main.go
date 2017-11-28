@@ -91,7 +91,7 @@ func main() {
 						lag := tOffset - cgOffset
 
 						log.Info("Topic: %s, Partition: %d, Consumer Group: %s, Lag: %d", topic, partitionID, cg.Name, lag)
-						if useTags != nil {
+						if *useTags {
 							var tags []string
 							tags = append(tags, "topic="+topic)
 							tags = append(tags, fmt.Sprintf("partition=%d", partitionID))
