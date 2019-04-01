@@ -1,2 +1,5 @@
 .goxc.json
 .goxc.local.json
+
+# output binary
+kafka-statsd
