@@ -1,7 +1,10 @@
 package main
 
 import (
-	// "fmt"
+	"flag"
+	"fmt"
+	"time"
+
 	// "os"
 	// "os/signal"
 	"strings"
@@ -11,20 +14,17 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/Shopify/sarama"
-	// "github.com/quipo/statsd"
+	"github.com/quipo/statsd"
 	"github.com/segmentio/go-log"
-
 	// "github.com/wvanbergen/kazoo-go"
-	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 var (
-	brokers      = kingpin.Flag("brokers", "Kafka addresses (e.g. host1:9092,host2:9092)").Short('b').String()
-	statsdAddr   = kingpin.Flag("statsd-addr", "Statsd address").Short('s').String()
-	statsdPrefix = kingpin.Flag("statsd-prefix", "Statsd prefix").Short('p').String()
-	interval     = kingpin.Flag("refresh-interval", "Interval to refresh offset lag in seconds").Short('i').Default("5").Int()
-	useTags      = kingpin.Flag("use-tags", "Use tags if your StatsD client supports them (like DataDog and InfluxDB)").Default("false").Bool()
-	includeTags  = kingpin.Flag("include-tags", "Tags to include, if you want to include a host name or datacenter for example.").Strings()
+	brokers      = flag.String("brokers", "127.0.0.1:12008", "Kafka addresses (e.g. host1:9092,host2:9092)")
+	statsdAddr   = flag.String("statsd-addr", "127.0.0.1:8125", "Statsd address")
+	statsdPrefix = flag.String("statsd-prefix", "kafka.", "Statsd prefix")
+	interval     = flag.Int("refresh-interval", 5, "Interval to refresh offset lag in seconds")
+	useTags      = flag.Bool("use-tags", true, "Use tags if your StatsD client supports them (like DataDog and InfluxDB)")
 )
 
 type ClusterState struct {
@@ -36,18 +36,20 @@ type ClusterState struct {
 }
 
 func main() {
-	kingpin.Parse()
+	flag.Parse()
 
-	// statsdClient := statsd.NewStatsdClient(*statsdAddr, *statsdPrefix)
-	// err := statsdClient.CreateSocket()
-	// if err != nil {
-	// 	log.Error("Error creating statsd client: %s", err)
-	// 	return
-	// }
-	// stats := statsd.NewStatsdBuffer(time.Second, statsdClient)
-	// defer stats.Close()
+	statsdClient := statsd.NewStatsdClient(*statsdAddr, *statsdPrefix)
+	err := statsdClient.CreateSocket()
+	if err != nil {
+		log.Error("Error creating statsd client: %s", err)
+		return
+	}
+	stats := statsd.NewStatsdBuffer(time.Second, statsdClient)
+	defer stats.Close()
 
-	client, err := sarama.NewClient(strings.Split(*brokers, ","), nil)
+	brokerList := strings.Split(*brokers, ",")
+
+	client, err := sarama.NewClient(brokerList, nil)
 	if err != nil {
 		log.Error("Error connecting to Kafka (client): %s", err)
 		return
@@ -56,7 +58,7 @@ func main() {
 
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_0_0_0
-	admin, err := sarama.NewClusterAdmin(strings.Split(*brokers, ","), config)
+	admin, err := sarama.NewClusterAdmin(brokerList, config)
 	if err != nil {
 		log.Error("Error connecting to Kafka (admin): %s", err)
 		return
@@ -80,6 +82,42 @@ func main() {
 	// ticker := time.NewTicker(time.Duration(*interval) * time.Second)
 	// signals := make(chan os.Signal, 1)
 	// signal.Notify(signals, os.Interrupt)
+	topicPartitions, err := getTopicPartitions(client)
+	if err != nil {
+		log.Error("getTopicPartitions: %s", err)
+		return
+	}
+
+	for _, cg := range clusterState.ConsumerGroups {
+		oldOffsets, err := getOffsetsFromConsumerGroup(admin, cg, topicPartitions)
+		if err != nil {
+			log.Error("getOffsetsFromConsumerGroup: %s", err)
+			return
+		}
+
+		for topic, partitionOffsets := range oldOffsets {
+			latestOffsets, err := getOffsetsFromTopicAndPartitions(client, topic, topicPartitions[topic])
+			if err != nil {
+				log.Error("getOffsetsFromTopicAndPartitions: %s", err)
+				return
+			}
+
+			for partitionID, offset := range latestOffsets {
+				lag := offset - partitionOffsets[partitionID]
+
+				if *useTags {
+					var tags []string
+					tags = append(tags, "topic="+topic)
+					tags = append(tags, fmt.Sprintf("partition=%d", partitionID))
+					tags = append(tags, "consumer_group="+cg)
+					stats.Gauge(fmt.Sprintf("consumer_lag,%s", strings.Join(tags, ",")), lag)
+				} else {
+					stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg), lag)
+				}
+			}
+
+		}
+	}
 
 	// for {
 	// 	select {
@@ -149,6 +187,64 @@ func getConsumerGroups(admin sarama.ClusterAdmin) ([]string, error) {
 		}
 	}
 	return consumerGroups, nil
+}
+
+func getOffsetsFromConsumerGroup(admin sarama.ClusterAdmin, group string, topicPartitions map[string][]int32) (map[string]map[int32]int64, error) {
+	resp, err := admin.ListConsumerGroupOffsets(group, topicPartitions)
+	if err != nil {
+		return nil, errors.Wrap(err, "ListConsumerGroupOffsets")
+	}
+
+	result := map[string]map[int32]int64{}
+
+	for topic, block := range resp.Blocks {
+		topicMap := map[int32]int64{}
+		result[topic] = topicMap
+		for partitionID, offsetBlock := range block {
+			topicMap[partitionID] = offsetBlock.Offset
+		}
+	}
+
+	return result, nil
+}
+
+func getOffsetsFromTopicAndPartitions(client sarama.Client, topic string, partitions []int32) (map[int32]int64, error) {
+	result := map[int32]int64{}
+
+	type response struct {
+		partition int32
+		offset    int64
+		err       error
+	}
+	ch := make(chan *response)
+	defer close(ch)
+
+	for _, partition := range partitions {
+		go func(partition int32) {
+			offset, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
+			ch <- &response{
+				partition: partition,
+				offset:    offset,
+				err:       err,
+			}
+		}(partition)
+	}
+
+	var lastErr error
+	for i := 0; i < len(partitions); i++ {
+		res := <-ch
+		if res.err != nil {
+			lastErr = res.err
+		} else {
+			result[res.partition] = res.offset
+		}
+	}
+
+	if lastErr != nil {
+		return nil, errors.Wrap(lastErr, "GetOffset")
+	}
+
+	return result, nil
 }
 
 func getTopicPartitions(client sarama.Client) (map[string][]int32, error) {
