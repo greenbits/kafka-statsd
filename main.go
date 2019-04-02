@@ -3,6 +3,8 @@ package main
 import (
 	"flag"
 	"fmt"
+	"os"
+	"os/signal"
 	"time"
 
 	// "os"
@@ -65,114 +67,72 @@ func main() {
 	}
 	defer admin.Close()
 
-	// map of "consumer group name" -> "the word `consumer`"
-	clusterState, err := NewClusterState(client, admin)
-	if err != nil {
-		log.Error("Error getting consumer groups: %s", err)
-		return
-	}
-	log.Info("consumer groups %V", clusterState)
+	ticker := time.NewTicker(time.Duration(*interval) * time.Second)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
 
-	// consumerGroupList, err := client.ListConsumerGroups()
-	// if err != nil {
-	// 	log.Error("%s", err)
-	// 	return
-	// }
+	log.Info("Starting consumer offset daemon")
 
-	// ticker := time.NewTicker(time.Duration(*interval) * time.Second)
-	// signals := make(chan os.Signal, 1)
-	// signal.Notify(signals, os.Interrupt)
-	topicPartitions, err := getTopicPartitions(client)
-	if err != nil {
-		log.Error("getTopicPartitions: %s", err)
-		return
-	}
+	for {
+		select {
+		case <-ticker.C:
+			log.Info("Refetching consumer offset lag")
 
-	for _, cg := range clusterState.ConsumerGroups {
-		oldOffsets, err := getOffsetsFromConsumerGroup(admin, cg, topicPartitions)
-		if err != nil {
-			log.Error("getOffsetsFromConsumerGroup: %s", err)
-			return
-		}
-
-		for topic, partitionOffsets := range oldOffsets {
-			latestOffsets, err := getOffsetsFromTopicAndPartitions(client, topic, topicPartitions[topic])
+			// map of "consumer group name" -> "the word `consumer`"
+			clusterState, err := NewClusterState(client, admin)
 			if err != nil {
-				log.Error("getOffsetsFromTopicAndPartitions: %s", err)
+				log.Error("Error getting consumer groups: %s", err)
 				return
 			}
 
-			for partitionID, offset := range latestOffsets {
-				lag := offset - partitionOffsets[partitionID]
+			topicPartitions, err := getTopicPartitions(client)
+			if err != nil {
+				log.Error("getTopicPartitions: %s", err)
+				return
+			}
 
-				if *useTags {
-					var tags []string
-					tags = append(tags, "topic="+topic)
-					tags = append(tags, fmt.Sprintf("partition=%d", partitionID))
-					tags = append(tags, "consumer_group="+cg)
-					stats.Gauge(fmt.Sprintf("consumer_lag,%s", strings.Join(tags, ",")), lag)
-				} else {
-					stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg), lag)
+			for _, cg := range clusterState.ConsumerGroups {
+				log.Debug("Getting offsets for consumer group: %s", cg)
+
+				oldOffsets, err := getOffsetsFromConsumerGroup(admin, cg, topicPartitions)
+				if err != nil {
+					log.Error("getOffsetsFromConsumerGroup: %s", err)
+					return
+				}
+
+				for topic, partitionOffsets := range oldOffsets {
+					log.Debug("Getting offsets for topic: %s", topic)
+
+					latestOffsets, err := getOffsetsFromTopicAndPartitions(client, topic, topicPartitions[topic])
+					if err != nil {
+						log.Error("getOffsetsFromTopicAndPartitions: %s", err)
+						return
+					}
+
+					for partitionID, offset := range latestOffsets {
+						log.Debug("Sending lag for partition ID: %d", partitionID)
+
+						lag := offset - partitionOffsets[partitionID]
+
+						if *useTags {
+							var tags []string
+							tags = append(tags, "topic="+topic)
+							tags = append(tags, fmt.Sprintf("partition=%d", partitionID))
+							tags = append(tags, "consumer_group="+cg)
+							stats.Gauge(fmt.Sprintf("consumer_lag,%s", strings.Join(tags, ",")), lag)
+						} else {
+							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg), lag)
+						}
+					}
 				}
 			}
 
+		case <-signals:
+			log.Info("Got interrupt signal, exiting.")
+			return
 		}
 	}
-
-	// for {
-	// 	select {
-	// 	case <-ticker.C:
-	// 		log.Info("Refreshing offset lag")
-	// 		err = gatherStats(client, stats)
-
-	// 		for _, cg := range consumerGroupList {
-	// 			offsets, err := cg.FetchAllOffsets()
-	// 			if err != nil {
-	// 				log.Error("%s", err)
-	// 				return
-	// 			}
-	// 			for topic, m := range offsets {
-	// 				for partitionID, cgOffset := range m {
-	// 					tOffset, err := client.GetOffset(topic, partitionID, sarama.OffsetNewest)
-	// 					if err != nil {
-	// 						log.Error("%s", err)
-	// 						return
-	// 					}
-	// 					lag := tOffset - cgOffset
-
-	// 					log.Info("Topic: %s, Partition: %d, Consumer Group: %s, Lag: %d", topic, partitionID, cg.Name, lag)
-	// 					if *useTags {
-	// 						var tags []string
-	// 						tags = append(tags, "topic="+topic)
-	// 						tags = append(tags, fmt.Sprintf("partition=%d", partitionID))
-	// 						tags = append(tags, "consumer_group="+cg.Name)
-	// 						if includeTags != nil {
-	// 							for _, t := range *includeTags {
-	// 								tags = append(tags, t)
-	// 							}
-	// 						}
-	// 						stats.Gauge(fmt.Sprintf("consumer_lag,%s", strings.Join(tags, ",")), lag)
-	// 					} else {
-	// 						stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg.Name), lag)
-	// 					}
-	// 				}
-	// 			}
-	// 		}
-	// 	case <-signals:
-	// 		log.Info("Got interrupt signal, exiting.")
-	// 		return
-	// 	}
-	// }
 }
-
-// func gatherStats(kafka sarama.ClusterAdmin, stats *statsd.StatsdBuffer) error {
-// 	consumerGroups, err := kafka.ListConsumerGroups()
-// 	if err != nil {
-// 		return err
-// 	}
-
-// 	return nil
-// }
 
 func getConsumerGroups(admin sarama.ClusterAdmin) ([]string, error) {
 	cgMap, err := admin.ListConsumerGroups()
@@ -198,10 +158,12 @@ func getOffsetsFromConsumerGroup(admin sarama.ClusterAdmin, group string, topicP
 	result := map[string]map[int32]int64{}
 
 	for topic, block := range resp.Blocks {
-		topicMap := map[int32]int64{}
-		result[topic] = topicMap
-		for partitionID, offsetBlock := range block {
-			topicMap[partitionID] = offsetBlock.Offset
+		if topic != "__consumer_offsets" {
+			topicMap := map[int32]int64{}
+			result[topic] = topicMap
+			for partitionID, offsetBlock := range block {
+				topicMap[partitionID] = offsetBlock.Offset
+			}
 		}
 	}
 
