@@ -1,32 +1,29 @@
 package main
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"time"
 
-	// "os"
-	// "os/signal"
 	"strings"
 	"sync"
 
-	// "time"
-	"github.com/pkg/errors"
-
 	"github.com/Shopify/sarama"
+	"github.com/pkg/errors"
 	"github.com/quipo/statsd"
 	"github.com/segmentio/go-log"
-	// "github.com/wvanbergen/kazoo-go"
+
+	"github.com/alecthomas/kingpin"
 )
 
 var (
-	brokers      = flag.String("brokers", "127.0.0.1:12008", "Kafka addresses (e.g. host1:9092,host2:9092)")
-	statsdAddr   = flag.String("statsd-addr", "127.0.0.1:8125", "Statsd address")
-	statsdPrefix = flag.String("statsd-prefix", "kafka.", "Statsd prefix")
-	interval     = flag.Int("refresh-interval", 5, "Interval to refresh offset lag in seconds")
-	useTags      = flag.Bool("use-tags", true, "Use tags if your StatsD client supports them (like DataDog and InfluxDB)")
+	brokers      = kingpin.Flag("brokers", "Comma separated list of kafka brokers (e.g. host1:9092,host2:9092").Short('b').Envar("KSTATSD_BROKERS").Required().String()
+	statsdAddr   = kingpin.Flag("statsd-addr", "Statsd address").Short('s').Default("127.0.0.1:8125").Envar("KSTATSD_STATSD_ADDR").String()
+	statsdPrefix = kingpin.Flag("statsd-prefix", "Statsd prefix").Short('p').Envar("KSTATSD_STATSD_PREFIX").String()
+	interval     = kingpin.Flag("refresh-interval", "Interval to refresh offset lag in seconds").Short('i').Default("5").Envar("KSTATSD_INTERVAL").Int()
+	useTags      = kingpin.Flag("use-tags", "Use tags if your StatsD client supports them (like DataDog and InfluxDB)").Default("false").Envar("KSTATSD_USE_TAGS").Bool()
+	includeTags  = kingpin.Flag("include-tags", "Tags to include, if you want to include a host name or datacenter for example.").Envar("KSTATSD_TAGS").Strings()
 )
 
 type ClusterState struct {
@@ -38,7 +35,7 @@ type ClusterState struct {
 }
 
 func main() {
-	flag.Parse()
+	kingpin.Parse()
 
 	statsdClient := statsd.NewStatsdClient(*statsdAddr, *statsdPrefix)
 	err := statsdClient.CreateSocket()
@@ -119,6 +116,11 @@ func main() {
 							tags = append(tags, "topic="+topic)
 							tags = append(tags, fmt.Sprintf("partition=%d", partitionID))
 							tags = append(tags, "consumer_group="+cg)
+							if includeTags != nil {
+								for _, t := range *includeTags {
+									tags = append(tags, t)
+								}
+							}
 							stats.Gauge(fmt.Sprintf("consumer_lag,%s", strings.Join(tags, ",")), lag)
 						} else {
 							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg), lag)
