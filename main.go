@@ -10,22 +10,62 @@ import (
 	"sync"
 
 	"github.com/Shopify/sarama"
-	"github.com/pkg/errors"
-	"github.com/quipo/statsd"
-	"github.com/segmentio/go-log"
-
 	"github.com/alecthomas/kingpin"
+	"github.com/pkg/errors"
+	"github.com/segmentio/go-log"
+	"gopkg.in/alexcesaro/statsd.v2"
 )
 
 var (
-	brokers      = kingpin.Flag("brokers", "Comma separated list of kafka brokers (e.g. host1:9092,host2:9092").Short('b').Envar("KSTATSD_BROKERS").Required().String()
+	brokers      = kingpin.Flag("broker", "A kafka broker to connect to.  Specify multiple times for multiple brokers. (e.g. host1:9092)").HintOptions("host1:9092").Short('b').Envar("KSTATSD_BROKERS").Required().Strings()
 	statsdAddr   = kingpin.Flag("statsd-addr", "Statsd address").Short('s').Default("127.0.0.1").Envar("KSTATSD_STATSD_ADDR").String()
 	statsdPort   = kingpin.Flag("statsd-port", "Statsd port").Short('P').Default("8125").Envar("KSTATSD_STATSD_PORT").String()
 	statsdPrefix = kingpin.Flag("statsd-prefix", "Statsd prefix").Short('p').Envar("KSTATSD_STATSD_PREFIX").String()
 	interval     = kingpin.Flag("refresh-interval", "Interval to refresh offset lag in seconds").Short('i').Default("5").Envar("KSTATSD_INTERVAL").Int()
-	useTags      = kingpin.Flag("use-tags", "Use tags if your StatsD client supports them (like DataDog and InfluxDB)").Default("false").Envar("KSTATSD_USE_TAGS").Bool()
-	includeTags  = kingpin.Flag("include-tags", "Tags to include, if you want to include a host name or datacenter for example.").Envar("KSTATSD_TAGS").Strings()
+	tagType      = kingpin.Flag("tag-format", "Format to use when encoding tags (Options: none, influxdb, datadog)").HintOptions(statsdTagOptionsEnum()...).Default("none").Envar("KSTATSD_USE_TAGS").Enum(statsdTagOptionsEnum()...)
+	includeTags  = kingpin.Flag("tag", "Tags to include.  Specify multiple times for multiple tags. (e.g. tagname:value)").HintOptions("tagname:value").Envar("KSTATSD_TAGS").Strings()
 )
+
+var statsdTagFormat = map[string]statsd.TagFormat{
+	"influxdb": statsd.InfluxDB,
+	"datadog":  statsd.Datadog,
+	"none":     0,
+}
+
+func statsdTagOptionsEnum() []string {
+	res := make([]string, 0, len(statsdTagFormat))
+	for k := range statsdTagFormat {
+		res = append(res, k)
+	}
+	return res
+}
+
+func newStatsdClient() (*statsd.Client, error) {
+	tags := make([]string, 0, len(*includeTags)*2)
+	for _, tag := range *includeTags {
+		splitTag := strings.SplitN(tag, ":", 2)
+		tags = append(tags, splitTag...)
+	}
+
+	opts := []statsd.Option{
+		statsd.Address(strings.Join([]string{*statsdAddr, *statsdPort}, ":")),
+		statsd.Prefix(*statsdPrefix),
+		statsd.ErrorHandler(func(err error) {
+			log.Error("Statsd error: %s", err)
+		}),
+	}
+
+	if len(tags) > 0 {
+		opts = append(opts, statsd.Tags(tags...))
+	}
+
+	tagFormat := statsdTagFormat[*tagType]
+	if tagFormat != 0 {
+		opts = append(opts, statsd.TagsFormat(tagFormat))
+	}
+
+	return statsd.New(opts...)
+}
 
 type ClusterState struct {
 	// List of consumer groups that exist in the cluster
@@ -38,19 +78,14 @@ type ClusterState struct {
 func main() {
 	kingpin.Parse()
 
-	statsdHost := strings.Join([]string{*statsdAddr, *statsdPort}, ":")
-	statsdClient := statsd.NewStatsdClient(statsdHost, *statsdPrefix)
-	err := statsdClient.CreateSocket()
+	statsdClient, err := newStatsdClient()
 	if err != nil {
 		log.Error("Error creating statsd client: %s", err)
 		return
 	}
-	stats := statsd.NewStatsdBuffer(time.Second, statsdClient)
-	defer stats.Close()
+	defer statsdClient.Close()
 
-	brokerList := strings.Split(*brokers, ",")
-
-	client, err := sarama.NewClient(brokerList, nil)
+	client, err := sarama.NewClient(*brokers, nil)
 	if err != nil {
 		log.Error("Error connecting to Kafka (client): %s", err)
 		return
@@ -59,7 +94,7 @@ func main() {
 
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_0_0_0
-	admin, err := sarama.NewClusterAdmin(brokerList, config)
+	admin, err := sarama.NewClusterAdmin(*brokers, config)
 	if err != nil {
 		log.Error("Error connecting to Kafka (admin): %s", err)
 		return
@@ -113,17 +148,14 @@ func main() {
 
 						lag := offset - partitionOffsets[partitionID]
 
-						if *useTags {
-							var tags []string
-							tags = append(tags, "topic="+topic)
-							tags = append(tags, fmt.Sprintf("partition=%d", partitionID))
-							tags = append(tags, "consumer_group="+cg)
-							if includeTags != nil {
-								for _, t := range *includeTags {
-									tags = append(tags, t)
-								}
-							}
-							stats.Gauge(fmt.Sprintf("consumer_lag,%s", strings.Join(tags, ",")), lag)
+						stats := statsdClient.Clone(
+							statsd.Tags("topic", topic),
+							statsd.Tags("partition", string(partitionID)),
+							statsd.Tags("consumer_group", cg),
+						)
+
+						if *tagType != "none" {
+							stats.Gauge("consumer_lag", lag)
 						} else {
 							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg), lag)
 						}
