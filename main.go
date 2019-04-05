@@ -19,7 +19,8 @@ import (
 
 var (
 	brokers      = kingpin.Flag("brokers", "Comma separated list of kafka brokers (e.g. host1:9092,host2:9092").Short('b').Envar("KSTATSD_BROKERS").Required().String()
-	statsdAddr   = kingpin.Flag("statsd-addr", "Statsd address").Short('s').Default("127.0.0.1:8125").Envar("KSTATSD_STATSD_ADDR").String()
+	statsdAddr   = kingpin.Flag("statsd-addr", "Statsd address").Short('s').Default("127.0.0.1").Envar("KSTATSD_STATSD_ADDR").String()
+	statsdPort   = kingpin.Flag("statsd-port", "Statsd port").Short('P').Default("8125").Envar("KSTATSD_STATSD_PORT").String()
 	statsdPrefix = kingpin.Flag("statsd-prefix", "Statsd prefix").Short('p').Envar("KSTATSD_STATSD_PREFIX").String()
 	interval     = kingpin.Flag("refresh-interval", "Interval to refresh offset lag in seconds").Short('i').Default("5").Envar("KSTATSD_INTERVAL").Int()
 	useTags      = kingpin.Flag("use-tags", "Use tags if your StatsD client supports them (like DataDog and InfluxDB)").Default("false").Envar("KSTATSD_USE_TAGS").Bool()
@@ -37,7 +38,8 @@ type ClusterState struct {
 func main() {
 	kingpin.Parse()
 
-	statsdClient := statsd.NewStatsdClient(*statsdAddr, *statsdPrefix)
+	statsdHost := strings.Join([]string{*statsdAddr, *statsdPort}, ":")
+	statsdClient := statsd.NewStatsdClient(statsdHost, *statsdPrefix)
 	err := statsdClient.CreateSocket()
 	if err != nil {
 		log.Error("Error creating statsd client: %s", err)
