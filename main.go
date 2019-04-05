@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"time"
 
 	"strings"
@@ -49,10 +50,13 @@ func newStatsdClient() (*statsd.Client, error) {
 
 	opts := []statsd.Option{
 		statsd.Address(strings.Join([]string{*statsdAddr, *statsdPort}, ":")),
-		statsd.Prefix(*statsdPrefix),
 		statsd.ErrorHandler(func(err error) {
 			log.Error("Statsd error: %s", err)
 		}),
+	}
+
+	if *statsdPrefix != "" {
+		opts = append(opts, statsd.Prefix(*statsdPrefix))
 	}
 
 	if len(tags) > 0 {
@@ -150,7 +154,7 @@ func main() {
 
 						stats := statsdClient.Clone(
 							statsd.Tags("topic", topic),
-							statsd.Tags("partition", string(partitionID)),
+							statsd.Tags("partition", strconv.FormatInt(int64(partitionID), 10)),
 							statsd.Tags("consumer_group", cg),
 						)
 
