@@ -160,8 +160,10 @@ func main() {
 
 						if *tagType != "none" {
 							stats.Gauge("consumer_lag", lag)
+							stats.Gauge("offset", offset)
 						} else {
-							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg), lag)
+							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.consumer_lag", topic, partitionID, cg), lag)
+							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.offset", topic, partitionID, cg), offset)
 						}
 					}
 				}
