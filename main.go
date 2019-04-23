@@ -71,12 +71,9 @@ func newStatsdClient() (*statsd.Client, error) {
 	return statsd.New(opts...)
 }
 
-type ClusterState struct {
-	// List of consumer groups that exist in the cluster
-	ConsumerGroups []string
-
-	// Map of topics to topic partitions
-	Topics map[string][]int32
+func isTaggedReporting() bool {
+	// There's probably a better way to do this than string comparison
+	return *tagType != "none"
 }
 
 func main() {
@@ -94,7 +91,12 @@ func main() {
 		log.Error("Error connecting to Kafka (client): %s", err)
 		return
 	}
-	defer client.Close()
+	defer func() {
+		err := client.Close()
+		if err != nil {
+			log.Error("Error closing kafka client connection: %s", err)
+		}
+	}()
 
 	config := sarama.NewConfig()
 	config.Version = sarama.V2_0_0_0
@@ -103,7 +105,12 @@ func main() {
 		log.Error("Error connecting to Kafka (admin): %s", err)
 		return
 	}
-	defer admin.Close()
+	defer func() {
+		err := admin.Close()
+		if err != nil {
+			log.Error("Error closing kafka admin connection: %s", err)
+		}
+	}()
 
 	ticker := time.NewTicker(time.Duration(*interval) * time.Second)
 	signals := make(chan os.Signal, 1)
@@ -115,56 +122,9 @@ func main() {
 		select {
 		case <-ticker.C:
 			log.Info("Refetching consumer offset lag")
-
-			// map of "consumer group name" -> "the word `consumer`"
-			clusterState, err := NewClusterState(client, admin)
+			err := refreshAndReportMetrics(statsdClient, client, admin)
 			if err != nil {
-				log.Error("Error getting consumer groups: %s", err)
-				return
-			}
-
-			topicPartitions, err := getTopicPartitions(client)
-			if err != nil {
-				log.Error("getTopicPartitions: %s", err)
-				return
-			}
-
-			for _, cg := range clusterState.ConsumerGroups {
-				log.Debug("Getting offsets for consumer group: %s", cg)
-
-				oldOffsets, err := getOffsetsFromConsumerGroup(admin, cg, topicPartitions)
-				if err != nil {
-					log.Error("getOffsetsFromConsumerGroup: %s", err)
-					return
-				}
-
-				for topic, partitionOffsets := range oldOffsets {
-					log.Debug("Getting offsets for topic: %s", topic)
-
-					latestOffsets, err := getOffsetsFromTopicAndPartitions(client, topic, topicPartitions[topic])
-					if err != nil {
-						log.Error("getOffsetsFromTopicAndPartitions: %s", err)
-						return
-					}
-
-					for partitionID, offset := range latestOffsets {
-						log.Debug("Sending lag for partition ID: %d", partitionID)
-
-						lag := offset - partitionOffsets[partitionID]
-
-						stats := statsdClient.Clone(
-							statsd.Tags("topic", topic),
-							statsd.Tags("partition", strconv.FormatInt(int64(partitionID), 10)),
-							statsd.Tags("consumer_group", cg),
-						)
-
-						if *tagType != "none" {
-							stats.Gauge("consumer_lag", lag)
-						} else {
-							stats.Gauge(fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.lag", topic, partitionID, cg), lag)
-						}
-					}
-				}
+				log.Error("Error occurred while refreshing cluster lag: %s", err)
 			}
 
 		case <-signals:
@@ -172,6 +132,61 @@ func main() {
 			return
 		}
 	}
+}
+
+func refreshAndReportMetrics(statsdClient *statsd.Client, client sarama.Client, admin sarama.ClusterAdmin) error {
+	// No need to thread statsd client interaction, the statsd client does buffered/batch sending for us
+
+	clusterState, err := collectClusterState(client, admin)
+	if err != nil {
+		return errors.Wrap(err, "getting consumer groups")
+	}
+
+	for topic, parts := range clusterState.TopicOffsets {
+		log.Debug("Reporting offsets for topic %s (parts: %v)", topic, parts)
+		for partition, position := range parts {
+			stats := statsdClient.Clone(
+				statsd.Tags("topic", topic),
+				statsd.Tags("partition", strconv.FormatInt(int64(partition), 10)),
+			)
+			if isTaggedReporting() {
+				stats.Gauge("partition.offset", position)
+			} else {
+				key := fmt.Sprintf("topic.%s.partition.%d.offset", topic, partition)
+				stats.Gauge(key, position)
+			}
+		}
+	}
+
+	for group, topicMap := range clusterState.ConsumerOffsets {
+		log.Debug("Reporting offsets for consumer group %s (parts :%v)", group, topicMap)
+
+		for topic, partitionMap := range topicMap {
+			for partition, consumerOffset := range partitionMap {
+				stats := statsdClient.Clone(
+					statsd.Tags("topic", topic),
+					statsd.Tags("partition", strconv.FormatInt(int64(partition), 10)),
+					statsd.Tags("consumer_group", group),
+				)
+
+				topicOffset := clusterState.TopicOffsets[topic][partition]
+				lag := topicOffset - consumerOffset
+
+				if isTaggedReporting() {
+					stats.Gauge("consumer.offset", consumerOffset)
+					stats.Gauge("consumer.lag", lag)
+				} else {
+					offsetKey := fmt.Sprintf("topic.%s.partition.%d.consumer_group.%s.offset", topic, partition, group)
+					stats.Gauge(offsetKey, consumerOffset)
+
+					lagKey := fmt.Sprint("topic.%s.partition.%d.consumer_group.%s.offset", topic, partition, group)
+					stats.Gauge(lagKey, lag)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 func getConsumerGroups(admin sarama.ClusterAdmin) ([]string, error) {
@@ -189,20 +204,49 @@ func getConsumerGroups(admin sarama.ClusterAdmin) ([]string, error) {
 	return consumerGroups, nil
 }
 
-func getOffsetsFromConsumerGroup(admin sarama.ClusterAdmin, group string, topicPartitions map[string][]int32) (map[string]map[int32]int64, error) {
-	resp, err := admin.ListConsumerGroupOffsets(group, topicPartitions)
-	if err != nil {
-		return nil, errors.Wrap(err, "ListConsumerGroupOffsets")
+func getConsumerGroupOffsets(admin sarama.ClusterAdmin, groups ...string) (map[string]map[string]map[int32]int64, error) {
+	type res struct {
+		group string
+		value *sarama.OffsetFetchResponse
+		err   error
+	}
+	responses := make(chan *res, len(groups))
+	var wg sync.WaitGroup
+
+	for _, group := range groups {
+		wg.Add(1)
+		go func(grp string) {
+			defer wg.Done()
+			response, err := admin.ListConsumerGroupOffsets(grp, nil)
+			responses <- &res{
+				group: grp,
+				value: response,
+				err:   err,
+			}
+		}(group)
 	}
 
-	result := map[string]map[int32]int64{}
+	wg.Wait()
+	close(responses)
 
-	for topic, block := range resp.Blocks {
-		if topic != "__consumer_offsets" {
-			topicMap := map[int32]int64{}
-			result[topic] = topicMap
-			for partitionID, offsetBlock := range block {
-				topicMap[partitionID] = offsetBlock.Offset
+	// Map consumer group -> topic -> partition -> comnsumer offset
+	result := make(map[string]map[string]map[int32]int64, len(groups))
+	for r := range responses {
+		if r.err != nil {
+			return nil, r.err
+		}
+
+		topicMap, ok := result[r.group]
+		if !ok {
+			topicMap = make(map[string]map[int32]int64, len(r.value.Blocks))
+			result[r.group] = topicMap
+		}
+
+		for topic, block := range r.value.Blocks {
+			partitionMap := make(map[int32]int64, len(block))
+			topicMap[topic] = partitionMap
+			for partitionId, offsetBlock := range block {
+				partitionMap[partitionId] = offsetBlock.Offset
 			}
 		}
 	}
@@ -218,11 +262,14 @@ func getOffsetsFromTopicAndPartitions(client sarama.Client, topic string, partit
 		offset    int64
 		err       error
 	}
-	ch := make(chan *response)
-	defer close(ch)
+
+	ch := make(chan *response, len(partitions))
+	var wg sync.WaitGroup
 
 	for _, partition := range partitions {
+		wg.Add(1)
 		go func(partition int32) {
+			defer wg.Done()
 			offset, err := client.GetOffset(topic, partition, sarama.OffsetNewest)
 			ch <- &response{
 				partition: partition,
@@ -232,9 +279,11 @@ func getOffsetsFromTopicAndPartitions(client sarama.Client, topic string, partit
 		}(partition)
 	}
 
+	wg.Wait()
+	close(ch)
+
 	var lastErr error
-	for i := 0; i < len(partitions); i++ {
-		res := <-ch
+	for res := range ch {
 		if res.err != nil {
 			lastErr = res.err
 		} else {
@@ -249,7 +298,7 @@ func getOffsetsFromTopicAndPartitions(client sarama.Client, topic string, partit
 	return result, nil
 }
 
-func getTopicPartitions(client sarama.Client) (map[string][]int32, error) {
+func getTopicPartitions(client sarama.Client) (map[string]map[int32]int64, error) {
 	topics, err := client.Topics()
 	if err != nil {
 		return nil, errors.Wrap(err, "Topics")
@@ -257,41 +306,61 @@ func getTopicPartitions(client sarama.Client) (map[string][]int32, error) {
 
 	type response struct {
 		topic string
-		pts   []int32
+		pts   map[int32]int64
 		err   error
 	}
-	ch := make(chan *response)
+	ch := make(chan *response, len(topics))
+	var wg sync.WaitGroup
 
 	for _, topic := range topics {
+		wg.Add(1)
 		go func(topic string) {
+			defer wg.Done()
 			pts, err := client.Partitions(topic)
+			if err != nil {
+				ch <- &response{
+					topic: topic,
+					err:   errors.Wrap(err, "Partitions"),
+				}
+				return
+			}
+
+			parts, err := getOffsetsFromTopicAndPartitions(client, topic, pts)
+			if err != nil {
+				err = errors.Wrap(err, "getOffsetsFromTopicAndPartitions")
+			}
 			ch <- &response{
 				topic: topic,
-				pts:   pts,
+				pts:   parts,
 				err:   err,
 			}
 		}(topic)
 	}
 
-	partitions := map[string][]int32{}
-	var lastErr error
-	for i := 0; i < len(topics); i++ {
-		res := <-ch
-		if res.err != nil {
-			lastErr = res.err
-		} else {
-			partitions[res.topic] = res.pts
-		}
-	}
+	wg.Wait()
+	close(ch)
 
-	if lastErr != nil {
-		return nil, errors.Wrap(lastErr, "Partitions")
+	partitions := make(map[string]map[int32]int64, len(topics))
+	for res := range ch {
+		if res.err != nil {
+			return nil, res.err
+		}
+		partitions[res.topic] = res.pts
 	}
 	return partitions, nil
 }
 
+// ClusterState is a snapshot recording of the current kafka cluster's state
+type ClusterState struct {
+	// Mapping of consumer groups to topics to partitions to consumer offsets
+	ConsumerOffsets map[string]map[string]map[int32]int64
+
+	// Map of topics to partitions to latest partition offset
+	TopicOffsets map[string]map[int32]int64
+}
+
 // NewClusterState gathers the current state about consumers and topics in the cluster
-func NewClusterState(client sarama.Client, admin sarama.ClusterAdmin) (*ClusterState, error) {
+func collectClusterState(client sarama.Client, admin sarama.ClusterAdmin) (*ClusterState, error) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -299,11 +368,26 @@ func NewClusterState(client sarama.Client, admin sarama.ClusterAdmin) (*ClusterS
 	var err error
 	go func() {
 		defer wg.Done()
-		cs.ConsumerGroups, err = getConsumerGroups(admin)
+		var cgs []string
+		var e error
+		cgs, e = getConsumerGroups(admin)
+		if e != nil {
+			err = errors.Wrap(e, "getConsumerGroups")
+			return
+		}
+		cs.ConsumerOffsets, e = getConsumerGroupOffsets(admin, cgs...)
+		if e != nil {
+			err = errors.Wrap(e, "getConsumerGroupOffsets")
+		}
 	}()
+
 	go func() {
 		defer wg.Done()
-		cs.Topics, err = getTopicPartitions(client)
+		var e error
+		cs.TopicOffsets, e = getTopicPartitions(client)
+		if e != nil {
+			err = errors.Wrap(e, "getTopicPartitions")
+		}
 	}()
 	wg.Wait()
 
