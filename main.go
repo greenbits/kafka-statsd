@@ -13,8 +13,9 @@ import (
 	"github.com/Shopify/sarama"
 	"github.com/alecthomas/kingpin"
 	"github.com/pkg/errors"
-	"github.com/segmentio/go-log"
 	"gopkg.in/alexcesaro/statsd.v2"
+
+	log "github.com/sirupsen/logrus"
 )
 
 var (
@@ -25,6 +26,7 @@ var (
 	interval     = kingpin.Flag("refresh-interval", "Interval to refresh offset lag in seconds").Short('i').Default("5").Envar("KSTATSD_INTERVAL").Int()
 	tagType      = kingpin.Flag("tag-format", "Format to use when encoding tags (Options: none, influxdb, datadog)").HintOptions(statsdTagOptionsEnum()...).Default("none").Envar("KSTATSD_USE_TAGS").Enum(statsdTagOptionsEnum()...)
 	includeTags  = kingpin.Flag("tag", "Tags to include.  Specify multiple times for multiple tags. (e.g. tagname:value)").HintOptions("tagname:value").Envar("KSTATSD_TAGS").Strings()
+	logFormat    = kingpin.Flag("log-format", "Output format for logs").HintOptions("text", "json").Default("text").Envar("KSTATSD_LOG_FORMAT").Enum("text", "json")
 )
 
 var statsdTagFormat = map[string]statsd.TagFormat{
@@ -51,7 +53,7 @@ func newStatsdClient() (*statsd.Client, error) {
 	opts := []statsd.Option{
 		statsd.Address(strings.Join([]string{*statsdAddr, *statsdPort}, ":")),
 		statsd.ErrorHandler(func(err error) {
-			log.Error("Statsd error: %s", err)
+			log.WithField("error", err).Error("Statsd Error")
 		}),
 	}
 
@@ -79,22 +81,31 @@ func isTaggedReporting() bool {
 func main() {
 	kingpin.Parse()
 
+	// Set up logging
+	log.SetLevel(log.TraceLevel)
+	switch *logFormat {
+	case "json":
+		log.SetFormatter(&log.JSONFormatter{})
+	case "text":
+		log.SetFormatter(&log.TextFormatter{})
+	}
+
 	statsdClient, err := newStatsdClient()
 	if err != nil {
-		log.Error("Error creating statsd client: %s", err)
+		log.WithField("error", err).Error("Could not create statsd client")
 		return
 	}
 	defer statsdClient.Close()
 
 	client, err := sarama.NewClient(*brokers, nil)
 	if err != nil {
-		log.Error("Error connecting to Kafka (client): %s", err)
+		log.WithField("error", err).Error("Error creating kafka client connection")
 		return
 	}
 	defer func() {
 		err := client.Close()
 		if err != nil {
-			log.Error("Error closing kafka client connection: %s", err)
+			log.WithField("error", err).Error("Error closing kafka client connection")
 		}
 	}()
 
@@ -102,13 +113,13 @@ func main() {
 	config.Version = sarama.V2_1_0_0
 	admin, err := sarama.NewClusterAdmin(*brokers, config)
 	if err != nil {
-		log.Error("Error connecting to Kafka (admin): %s", err)
+		log.WithField("error", err).Error("Error creating kafka admin connection")
 		return
 	}
 	defer func() {
 		err := admin.Close()
 		if err != nil {
-			log.Error("Error closing kafka admin connection: %s", err)
+			log.WithField("error", err).Error("Error closing kafka admin connection")
 		}
 	}()
 
@@ -116,7 +127,10 @@ func main() {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, os.Interrupt)
 
-	log.Info("Starting consumer offset daemon")
+	log.WithFields(log.Fields{
+		"interval": *interval,
+		"brokers": brokers,
+	}).Info("Starting consumer offset daemon")
 
 	for {
 		select {
@@ -124,7 +138,7 @@ func main() {
 			log.Info("Refetching consumer offset lag")
 			err := refreshAndReportMetrics(statsdClient, client, admin)
 			if err != nil {
-				log.Error("Error occurred while refreshing cluster lag: %s", err)
+				log.WithField("error", err).Error("Error refreshingg consumer lag")
 			}
 
 		case <-signals:
@@ -143,7 +157,10 @@ func refreshAndReportMetrics(statsdClient *statsd.Client, client sarama.Client, 
 	}
 
 	for topic, parts := range clusterState.TopicOffsets {
-		log.Debug("Reporting offsets for topic %s (parts: %v)", topic, parts)
+		log.WithFields(log.Fields{
+			"topic": topic,
+			"parts": parts,
+		}).Debug("Reporting offsets for topic")
 		for partition, position := range parts {
 			stats := statsdClient.Clone(
 				statsd.Tags("topic", topic),
@@ -159,7 +176,10 @@ func refreshAndReportMetrics(statsdClient *statsd.Client, client sarama.Client, 
 	}
 
 	for group, topicMap := range clusterState.ConsumerOffsets {
-		log.Debug("Reporting offsets for consumer group %s (parts :%v)", group, topicMap)
+		log.WithFields(log.Fields{
+			"consumer_group": group,
+			"topic_map": topicMap,
+		}).Debug("Reporting offsets for consumer group")
 
 		for topic, partitionMap := range topicMap {
 			for partition, consumerOffset := range partitionMap {
@@ -218,7 +238,11 @@ func getConsumerGroupOffsets(admin sarama.ClusterAdmin, partitions map[string][]
 		go func(grp string) {
 			defer wg.Done()
 			response, err := admin.ListConsumerGroupOffsets(grp, partitions)
-			log.Debug("admin.ListConsumerGroups(%s, nil) = %v, %v", grp, response, err)
+			log.WithFields(log.Fields{
+				"group": grp,
+				"response": response,
+				"err": err,
+			}).Trace("admin.ListConsumerGroups(group, nil) = response, err")
 			responses <- &res{
 				group: grp,
 				value: response,
@@ -246,8 +270,8 @@ func getConsumerGroupOffsets(admin sarama.ClusterAdmin, partitions map[string][]
 		for topic, block := range r.value.Blocks {
 			partitionMap := make(map[int32]int64, len(block))
 			topicMap[topic] = partitionMap
-			for partitionId, offsetBlock := range block {
-				partitionMap[partitionId] = offsetBlock.Offset
+			for partitionID, offsetBlock := range block {
+				partitionMap[partitionID] = offsetBlock.Offset
 			}
 		}
 	}
